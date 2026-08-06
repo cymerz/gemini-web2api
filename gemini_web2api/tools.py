@@ -31,6 +31,41 @@ def _compress_b64_if_needed(b64: str) -> str:
         return b64[:MAX_IMAGE_B64_SIZE]
 
 
+def _extract_image_part(c: dict):
+    """Extract image from an OpenAI content part.
+
+    Supports:
+      - {"type": "image_url", "image_url": "..." | {"url": "..."}}
+      - {"type": "image" | "input_image", "image_url": "..."}  (Responses API)
+
+    Returns (data, mime_type) where data is raw bytes (base64 data URI)
+    or a URL string to be fetched later. Returns None if not an image part.
+    """
+    url = None
+    mime = c.get("mime_type") or c.get("mimeType")
+    if c.get("type") == "image_url":
+        iu = c.get("image_url")
+        if isinstance(iu, str):
+            url = iu
+        elif isinstance(iu, dict):
+            url = iu.get("url", "")
+    elif c.get("type") in ("image", "input_image"):
+        url = c.get("image_url") or c.get("file_url") or ""
+    if not url or not isinstance(url, str):
+        return None
+    if url.startswith("data:"):
+        m = re.match(r'^data:(image/[\w+.-]+)?;base64,(.*)$', url, re.DOTALL)
+        if not m:
+            return None
+        try:
+            return base64.b64decode(m.group(2)), (mime or m.group(1) or "image/png")
+        except Exception:
+            return None
+    if url.startswith(("http://", "https://")):
+        return url, (mime or "image/png")
+    return None
+
+
 def _build_tool_choice_instruction(tool_choice, tool_defs: list) -> str:
     """Build tool_choice constraint instruction.
 
@@ -54,7 +89,8 @@ def _build_tool_choice_instruction(tool_choice, tool_defs: list) -> str:
 def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> tuple:
     """Convert OpenAI messages to (prompt_str, images_list).
 
-    Returns (prompt, images) where images is a list of (bytes, mime_type) tuples.
+    Returns (prompt, images) where images is a list of (bytes_or_url, mime_type)
+    tuples; bytes come from base64 data URIs, urls are fetched at upload time.
     """
     parts = []
     images = []
@@ -86,12 +122,16 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
         if isinstance(content, list):
             text_parts = []
             for c in content:
+                if not isinstance(c, dict):
+                    continue
                 if c.get("type") in ("text", "input_text"):
                     text_parts.append(c.get("text", ""))
-                elif c.get("type") == "image_url":
-                    text_parts.append("[Note: Image input not supported in this API. Please describe the image in text.]")
-                elif c.get("type") == "image":
-                    text_parts.append("[Note: Image input not supported in this API. Please describe the image in text.]")
+                else:
+                    img = _extract_image_part(c)
+                    if img:
+                        images.append(img)
+                        # Marker keeps part ordering and tells the model an image is attached
+                        text_parts.append("[Attached image]")
             content = " ".join(text_parts)
 
         if role == "system":
@@ -185,7 +225,7 @@ def _google_tool_choice_instruction(req: dict) -> str:
 def google_contents_to_prompt(req: dict) -> tuple:
     """Convert Google API contents/tools/systemInstruction to (prompt_str, images_list).
 
-    Returns (prompt, images) where images is a list of (bytes, mime_type) tuples.
+    Returns (prompt, images) where images is a list of (bytes_or_url, mime_type) tuples.
     """
     parts = []
     images = []
@@ -227,7 +267,11 @@ def google_contents_to_prompt(req: dict) -> tuple:
             elif p.get("inlineData"):
                 data = p["inlineData"]
                 mime = data.get("mimeType", "image/png")
-                images.append((base64.b64decode(data["data"]), mime))
+                try:
+                    images.append((base64.b64decode(data["data"]), mime))
+                    msg_parts.append("[Attached image]")
+                except Exception:
+                    pass
             elif p.get("functionCall"):
                 fc = p["functionCall"]
                 msg_parts.append(

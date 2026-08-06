@@ -13,6 +13,7 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, 
 - **Optional API Keys**: no auth when `api_keys` is empty, OpenAI-style Bearer auth when configured
 - **OpenAI Compatible**: Drop-in replacement for `/v1/chat/completions` and `/v1/models`
 - **Tool Calling**: Full function calling support (OpenAI format)
+- **Image Input**: Vision/multimodal via `image_url` (base64 data URI or HTTP URL), uploaded through Gemini's Scotty resumable upload
 - **Multiple Models**: Flash (3.6), Extended Thinking (20k+ char output), Pro, Auto, Lite
 - **Thinking Depth**: Adjustable via `@think=N` suffix (0=deepest, 4=shallowest)
 - **Web Search**: Built-in internet access (Gemini's native search)
@@ -244,9 +245,36 @@ resp = client.chat.completions.create(
 )
 ```
 
+## Image Input
+
+Images are sent in standard OpenAI multimodal format. The server decodes/fetches each image, uploads it to Google's `content-push` backend via the Scotty resumable upload protocol, and attaches the resulting file reference to the generation request — the same flow the Gemini web app uses.
+
+Both base64 data URIs and HTTP(S) URLs are supported:
+
+```python
+import base64
+img_b64 = base64.b64encode(open("photo.png", "rb").read()).decode()
+resp = client.chat.completions.create(
+    model="gemini-3.5-flash",
+    messages=[{"role": "user", "content": [
+        {"type": "text", "text": "What is in this image?"},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+    ]}]
+)
+```
+
+```python
+# Or reference an image by URL (the server fetches it)
+{"type": "image_url", "image_url": {"url": "https://example.com/photo.jpg"}}
+```
+
+Image parts are also accepted on `/v1/responses` (`input_image`) and on the Google-native `/v1beta/models/...:generateContent` endpoint (`inlineData`).
+
+> **Note**: Image upload goes through Google's authenticated push service, so a valid Gemini session cookie (`cookie_file`) is required. Without one, uploads will be rejected and the request falls back to text-only.
+
 ## Limitations
 
-- **No image/multimodal input**: Gemini's image upload requires a proprietary streaming RPC protocol (WIZ/ProcessFile) that cannot be replicated in a standard HTTP proxy. Image inputs in messages will be ignored with a note.
+- **Image input needs a cookie**: Vision works through the Scotty resumable upload (see above), which requires an authenticated Gemini cookie. All images in a request are attached to the current turn.
 - **Not real Pro/Ultra**: Without a paid subscription cookie, `gemini-3.1-pro` routes to the same Flash model. The "Pro" label is a UI preference, not a backend model switch.
 - **Single-turn only**: Each request is an independent conversation. Multi-turn context is simulated by including previous messages in the prompt.
 - **Rate limits**: Google may throttle high-frequency requests. The server retries automatically but sustained heavy use may be blocked.

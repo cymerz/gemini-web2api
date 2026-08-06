@@ -13,6 +13,7 @@
 - **可选密钥**: `api_keys` 为空时免密, 填入密钥后按 OpenAI Bearer Key 校验
 - **OpenAI 兼容**: 直接替换 `/v1/chat/completions` 和 `/v1/models`
 - **工具调用**: 完整的 Function Calling 支持 (OpenAI 格式)
+- **图片输入**: 视觉/多模态支持, 通过 `image_url` (base64 data URI 或 HTTP URL) 发送, 经 Gemini Scotty 断点续传协议上传
 - **多模型**: Flash (3.6), 扩展思考 (2万字+输出), Pro, Auto, Lite
 - **思考深度**: 通过 `@think=N` 后缀调节 (0=最深, 4=最浅)
 - **联网搜索**: 内置互联网访问 (Gemini 原生搜索能力)
@@ -217,9 +218,36 @@ python gemini_web2api.py
 
 支持 Clash, V2Ray, Shadowsocks 等任何 HTTP 代理.
 
+## 图片输入
+
+图片使用标准 OpenAI 多模态格式发送. 服务端会解码/抓取每张图片, 通过 Scotty 断点续传协议上传到 Google 的 `content-push` 后端, 并把得到的文件引用附加到生成请求上 —— 与 Gemini 网页端上传附件的流程一致.
+
+支持 base64 data URI 和 HTTP(S) URL 两种形式:
+
+```python
+import base64
+img_b64 = base64.b64encode(open("photo.png", "rb").read()).decode()
+resp = client.chat.completions.create(
+    model="gemini-3.5-flash",
+    messages=[{"role": "user", "content": [
+        {"type": "text", "text": "这张图片里是什么?"},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+    ]}]
+)
+```
+
+```python
+# 或直接传图片 URL (由服务端抓取)
+{"type": "image_url", "image_url": {"url": "https://example.com/photo.jpg"}}
+```
+
+`/v1/responses` (`input_image`) 和 Google 原生 `/v1beta/models/...:generateContent` 接口 (`inlineData`) 同样支持图片.
+
+> **注意**: 图片上传经过 Google 的认证推送服务, 需要配置有效的 Gemini 会话 cookie (`cookie_file`). 未配置时上传会被拒绝, 请求自动回退为纯文本.
+
 ## 已知限制
 
-- **不支持图片/多模态输入**: Gemini 的图片上传需要专有的 WIZ streaming RPC 协议 (ProcessFile), 无法在标准 HTTP 代理中实现. 发送图片会被忽略并返回提示.
+- **图片输入需要 Cookie**: 视觉功能通过 Scotty 断点续传上传实现 (见上文), 需要已认证的 Gemini cookie. 一次请求中的所有图片都会附加到当前轮次.
 - **Pro/Ultra 非真实路由**: 无付费订阅 cookie 时, `gemini-3.1-pro` 实际路由到 Flash 模型. "Pro" 只是 UI 偏好标签.
 - **单轮对话**: 每次请求是独立对话, 多轮上下文通过在 prompt 中包含历史消息模拟.
 - **频率限制**: Google 可能限制高频请求, server 会自动重试但持续高负载可能被封.

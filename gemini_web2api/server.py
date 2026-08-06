@@ -21,7 +21,10 @@ def _usage(prompt: str, text: str) -> dict:
 
 
 def _upload_images(images: list) -> list:
-    """Upload images and return list of file references. Returns None if no images."""
+    """Upload images via Scotty resumable upload, return file references.
+
+    Each item is (bytes_or_url, mime_type). Returns None if no usable images.
+    """
     if not images:
         return None
     file_refs = []
@@ -30,10 +33,12 @@ def _upload_images(images: list) -> list:
             if isinstance(item, tuple) and len(item) == 2:
                 data, mime = item
                 if isinstance(data, str):
-                    data = fetch_image_bytes(data)
-                    mime = mime or "image/png"
+                    data, fetched_mime = fetch_image_bytes(data)
+                    mime = fetched_mime if fetched_mime.startswith("image/") else (mime or "image/png")
+                mime = mime or "image/png"
                 if data:
-                    ref = upload_image(data, "image.png", mime or "image/png")
+                    ext = mime.rsplit("/", 1)[-1].split("+")[0]
+                    ref = upload_image(data, f"image.{ext}", mime)
                     file_refs.append(ref)
         except Exception as e:
             log(f"Image upload failed: {e}")
@@ -261,7 +266,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         role = item.get("role", "user")
                         content = item.get("content", "")
                         if isinstance(content, list):
-                            content = " ".join(c.get("text", "") for c in content if c.get("type") in ("text", "input_text"))
+                            norm = []
+                            for c in content:
+                                if not isinstance(c, dict):
+                                    continue
+                                if c.get("type") in ("text", "input_text"):
+                                    norm.append({"type": "text", "text": c.get("text", "")})
+                                elif c.get("type") in ("image", "input_image"):
+                                    url = c.get("image_url") or c.get("file_url") or ""
+                                    if url:
+                                        norm.append({"type": "image_url", "image_url": {"url": url}})
+                            has_img = any(p["type"] == "image_url" for p in norm)
+                            content = norm if has_img else " ".join(p["text"] for p in norm if p.get("type") == "text")
                         messages.append({"role": role, "content": content})
 
         if tools:

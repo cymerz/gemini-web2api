@@ -6,6 +6,7 @@ import urllib.parse
 import time
 import ssl
 import re
+import os
 
 from .config import CONFIG
 from .gemini import load_cookie, make_sapisidhash, _get_ssl_ctx, log
@@ -116,12 +117,26 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
     return file_ref
 
 
-def fetch_image_bytes(url: str) -> bytes:
-    """Fetch image from URL."""
+def _guess_mime_from_url(url: str) -> str:
+    """Guess image mime type from URL file extension."""
+    ext = os.path.splitext(urllib.parse.urlparse(url).path)[1].lower()
+    return {
+        ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+        ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+        ".heic": "image/heic", ".heif": "image/heif",
+    }.get(ext, "image/png")
+
+
+def fetch_image_bytes(url: str) -> tuple:
+    """Fetch image from URL. Returns (bytes, mime_type); (b"", mime) on failure."""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         resp = urllib.request.urlopen(req, timeout=30)
-        return resp.read()
+        mime = resp.headers.get("Content-Type", "").split(";")[0].strip()
+        if not mime.startswith("image/"):
+            # Server returned generic content type; fall back to URL extension
+            mime = _guess_mime_from_url(url)
+        return resp.read(), mime
     except Exception as e:
         log(f"Image fetch failed: {e}")
-        return b""
+        return b"", "image/png"
