@@ -21,6 +21,7 @@ _ssl_ctx = None
 _cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
 _httpx_client = None
 _cookie_warned = {"unconfigured": False, "missing": False}
+_raw_dump_path = os.environ.get("GEMINI_RAW_DUMP")
 
 
 def log(msg: str):
@@ -223,6 +224,23 @@ def _auth_desc(headers: dict) -> str:
     return "no cookie (anonymous)"
 
 
+def _diagnose_empty_response(raw: str, has_files: bool):
+    """Log diagnostics when response extraction yielded no text."""
+    tag = " (images attached)" if has_files else ""
+    log(f"[DIAG] Empty response text extracted{tag}: raw_len={len(raw)}, "
+        f"wrb.fr_lines={sum(1 for l in raw.splitlines() if '\"wrb.fr\"' in l)}")
+    preview = raw[:600].replace("\n", "\\n")
+    log(f"[DIAG] Raw response head: {preview}")
+    if _raw_dump_path:
+        try:
+            with open(_raw_dump_path, "a", encoding="utf-8") as f:
+                f.write("=" * 40 + f" files={has_files} ts={time.strftime('%H:%M:%S')} " + "=" * 40 + "\n")
+                f.write(raw + "\n")
+            log(f"[DIAG] Raw response appended to {_raw_dump_path}")
+        except Exception as e:
+            log(f"[DIAG] Raw dump write failed: {e}")
+
+
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     """Non-streaming generation with retry."""
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
@@ -246,7 +264,10 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
             log(f"[COOKIE] Request OK (HTTP {resp.status}, auth: {auth})")
-            return extract_response_text(raw)
+            text = extract_response_text(raw)
+            if not text:
+                _diagnose_empty_response(raw, bool(file_refs))
+            return text
         except Exception as e:
             last_err = e
             if isinstance(e, urllib.error.HTTPError) and e.code in (401, 403):
@@ -280,6 +301,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 resp.raise_for_status()
                 log(f"[COOKIE] Stream OK (HTTP {resp.status_code}, auth: {auth})")
                 buf = ""
+                raw_lines = []
                 for chunk in resp.iter_text():
                     buf += chunk
                     if "BardErrorInfo" in buf:
@@ -292,6 +314,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                             )
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
+                        raw_lines.append(line)
                         for t in _extract_texts_from_line(line):
                             if t == emitted_raw_text or emitted_raw_text.startswith(t):
                                 continue
@@ -301,6 +324,8 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                             emitted_raw_text = t
                             if delta:
                                 yield delta
+            if not emitted_raw_text:
+                _diagnose_empty_response("\n".join(raw_lines), bool(file_refs))
             return
         except Exception as e:
             last_err = e
