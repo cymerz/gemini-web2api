@@ -13,7 +13,9 @@ services:
       # The file must exist before `docker compose up`, otherwise Docker
       # creates it as a directory. Set "cookie_file": "/app/cookie.txt"
       # in config.json when enabled.
-      # - ./cookie.txt:/app/cookie.txt:ro
+      # NOTE: do NOT mount it :ro — the server auto-rotates the short-lived
+      # __Secure-1PSIDTS cookie and writes the refreshed cookies back here.
+      # - ./cookie.txt:/app/cookie.txt
     # TEMPORARY: verbose upload diagnostics for the image-attachment 1100 bug.
     # Remove/comment out GEMINI_UPLOAD_DEBUG once image input works.
     environment:
