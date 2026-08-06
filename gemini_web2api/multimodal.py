@@ -205,6 +205,12 @@ def _cached_page_tokens() -> dict:
     return _page_tokens_cache["tokens"]
 
 
+def _invalidate_page_tokens():
+    """Drop cached tokens (e.g. after a 400 xsrf) so the next call re-fetches."""
+    _page_tokens_cache["tokens"] = {}
+    _page_tokens_cache["ts"] = 0
+
+
 def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str = "image/png",
                  extra_headers: dict = None) -> str:
     """Upload image via Scotty resumable upload. Returns file reference path."""

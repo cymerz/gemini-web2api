@@ -166,28 +166,26 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
             inner[k] = v
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
-    if file_refs:
-        # Attachment requests require the XSRF "at" token; without it the
-        # upstream rejects the request with BardErrorInfo [1003].
-        at = CONFIG.get("xsrf_token")
-        at_source = "config xsrf_token"
-        if not at:
-            try:
-                from .multimodal import _cached_page_tokens
-                at = _cached_page_tokens().get("at")
-                at_source = "page-derived token"
-            except Exception as e:
-                log(f"[MULTIMODAL] WARNING: failed to obtain XSRF 'at' token: {e}")
-        if at:
-            params["at"] = at
+    # The XSRF "at" token is mandatory for ALL requests on a fully authenticated
+    # session (upstream returns 400 "xsrf" without it) - not just attachments.
+    at = CONFIG.get("xsrf_token")
+    at_source = "config xsrf_token"
+    if not at and load_cookie()[0]:
+        try:
+            from .multimodal import _cached_page_tokens
+            at = _cached_page_tokens().get("at")
+            at_source = "page-derived token"
+        except Exception as e:
+            log(f"[MULTIMODAL] WARNING: failed to obtain XSRF 'at' token: {e}")
+    if at:
+        params["at"] = at
+        if file_refs:
             log(f"[MULTIMODAL] Attachment request: {len(file_refs)} file(s), "
                 f"XSRF 'at' token from {at_source}")
-        else:
-            log("[MULTIMODAL] WARNING: attachment request sent WITHOUT XSRF 'at' token - "
-                "upstream will likely reject with BardErrorInfo [1003] "
-                "(set xsrf_token in config from the page SNlM0e value)")
-    elif CONFIG.get("xsrf_token"):
-        params["at"] = CONFIG["xsrf_token"]
+    elif file_refs:
+        log("[MULTIMODAL] WARNING: attachment request sent WITHOUT XSRF 'at' token - "
+            "upstream will likely reject with BardErrorInfo [1003] "
+            "(set xsrf_token in config from the page SNlM0e value)")
     return urllib.parse.urlencode(params)
 
 
@@ -305,6 +303,15 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             last_err = e
             if isinstance(e, urllib.error.HTTPError) and e.code in (401, 403):
                 log(f"[COOKIE] AUTH FAILURE: HTTP {e.code} (auth: {auth}) - cookie may be expired or invalid")
+            if isinstance(e, urllib.error.HTTPError) and e.code == 400:
+                # Likely a stale XSRF "at" token: drop the cache and rebuild
+                # the body so the retry uses a freshly fetched token.
+                try:
+                    from .multimodal import _invalidate_page_tokens
+                    _invalidate_page_tokens()
+                except Exception:
+                    pass
+                body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Retry {attempt+1}/{CONFIG['retry_attempts']} (auth: {auth}): {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
@@ -365,6 +372,15 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             status = getattr(getattr(e, "response", None), "status_code", None)
             if status in (401, 403):
                 log(f"[COOKIE] AUTH FAILURE: HTTP {status} (auth: {auth}) - cookie may be expired or invalid")
+            if status == 400:
+                # Likely a stale XSRF "at" token: drop the cache and rebuild
+                # the body so the retry uses a freshly fetched token.
+                try:
+                    from .multimodal import _invalidate_page_tokens
+                    _invalidate_page_tokens()
+                except Exception:
+                    pass
+                body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']} (auth: {auth}): {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
