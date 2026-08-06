@@ -26,18 +26,18 @@ def _get_page_tokens_inner() -> dict:
         "Referer": "https://gemini.google.com/",
     }
     cookie_str, sapisid = load_cookie()
-    if cookie_str:
-        headers["Cookie"] = cookie_str
+    cj = _cookie_jar_from_str(cookie_str) if cookie_str else None
     try:
         req = urllib.request.Request("https://gemini.google.com/app", headers=headers)
         proxy = CONFIG.get("proxy")
+        handlers = [urllib.request.HTTPSHandler(context=_get_ssl_ctx())]
+        if cj is not None:
+            # Cookie jar captures Set-Cookie updates (fresh auth cookies).
+            handlers.append(urllib.request.HTTPCookieProcessor(cj))
         if proxy:
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-                urllib.request.HTTPSHandler(context=_get_ssl_ctx()))
-            resp = opener.open(req, timeout=30)
-        else:
-            resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=30)
+            handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        opener = urllib.request.build_opener(*handlers)
+        resp = opener.open(req, timeout=30)
         html = resp.read().decode()
         tokens = {}
         for key, pattern in [
@@ -57,6 +57,9 @@ def _get_page_tokens_inner() -> dict:
             m = re.search(r'"thykhd":"([^"]+)"', html)
             if m and m.group(1).startswith("ADR"):
                 tokens["at"] = m.group(1)
+        if cj is not None:
+            # Persist any refreshed auth cookies Google sent back.
+            _persist_if_updated_cookies(cj, cookie_str)
         if not tokens.get("at"):
             # Degraded session: __Secure-1PSIDTS is very likely expired.
             # Try rotating it once, then fetch the page again.
@@ -70,7 +73,7 @@ def _get_page_tokens_inner() -> dict:
 
 _page_tokens_cache = {"tokens": {}, "ts": 0}
 _upload_debug = bool(os.environ.get("GEMINI_UPLOAD_DEBUG"))
-_rotate_state = {"last_attempt": 0.0}
+_rotate_state = {"last_attempt": 0.0, "last_success": 0.0}
 
 
 def _cookie_jar_from_str(cookie_str: str):
@@ -79,14 +82,38 @@ def _cookie_jar_from_str(cookie_str: str):
     for part in cookie_str.split(";"):
         if "=" in part:
             k, v = part.strip().split("=", 1)
+            # NOTE: positional args are easy to mix up - keep explicit names.
+            # secure must stay False here; the default policy drops secure
+            # cookies whose names start with __Secure- when set via rest={}.
             cj.set_cookie(http.cookiejar.Cookie(
-                0, k, v, None, False, ".google.com", True, False,
-                "google.com", True, False, None, False, None, None, {}))
+                version=0, name=k, value=v, port=None, port_specified=False,
+                domain=".google.com", domain_specified=True, domain_initial_dot=True,
+                path="/", path_specified=True, secure=False, expires=None,
+                discard=False, comment=None, comment_url=None, rest={}))
     return cj
 
 
 def _jar_cookie_str(cj) -> str:
     return "; ".join(f"{c.name}={c.value}" for c in cj)
+
+
+def _persist_if_updated_cookies(cj, baseline: str = None):
+    """Persist the jar's cookies if any auth cookie changed vs the baseline.
+
+    Google issues refreshed __Secure-1PSIDTS/__Secure-1PSIDCC/3PSIDTS etc. via
+    Set-Cookie on normal page visits; capturing them keeps the session alive.
+    """
+    baseline_pairs = dict(p.strip().split("=", 1) for p in (baseline or "").split(";")
+                          if "=" in p) if baseline else {}
+    jar_pairs = {c.name: c.value for c in cj}
+    watch = ("__Secure-1PSIDTS", "__Secure-1PSIDCC", "__Secure-3PSIDTS", "SIDCC")
+    updated = any(jar_pairs.get(k) and jar_pairs[k] != baseline_pairs.get(k) for k in watch)
+    if not updated:
+        return
+    merged = "; ".join(f"{k}={v}" for k, v in {**baseline_pairs, **jar_pairs}.items())
+    _persist_rotated_cookies(merged)
+    _rotate_state["last_success"] = time.time()
+    log("[COOKIE] Refreshed auth cookies captured from Set-Cookie and persisted")
 
 
 def _persist_rotated_cookies(cookie_str: str):
@@ -105,15 +132,18 @@ def _persist_rotated_cookies(cookie_str: str):
             log(f"[COOKIE] WARNING: could not persist refreshed cookies: {e}")
 
 
-def _maybe_rotate_cookies() -> bool:
+def _maybe_rotate_cookies(force: bool = False) -> bool:
     """Refresh __Secure-1PSIDTS via accounts.google.com/RotateCookies.
 
     Google rotates this cookie frequently; when it expires the session degrades
-    (no SNlM0e token, uploads orphaned -> BardErrorInfo [1100]). Returns True
-    when a fresh __Secure-1PSIDTS was obtained. Throttled to once per 5 min.
+    (no SNlM0e token, uploads orphaned -> BardErrorInfo [1100]). Rotation only
+    succeeds while the cookie is still valid, so callers should invoke it
+    PROACTIVELY (force=True) on an interval, not only after failures.
+    Returns True when a fresh __Secure-1PSIDTS was obtained. Reactive calls
+    are throttled to once per 5 min.
     """
     now = time.time()
-    if now - _rotate_state["last_attempt"] < 300:
+    if not force and now - _rotate_state["last_attempt"] < 300:
         return False
     _rotate_state["last_attempt"] = now
 
@@ -145,6 +175,7 @@ def _maybe_rotate_cookies() -> bool:
                     f"{k}={v}" for k, v in
                     {**{c.name: c.value for c in cj}, **dict(s.cookies.items())}.items())
                 _persist_rotated_cookies(merged)
+                _rotate_state["last_success"] = time.time()
                 log("[COOKIE] __Secure-1PSIDTS rotated successfully (curl_cffi) - session refreshed")
                 s.close()
                 return True
@@ -187,12 +218,20 @@ def _maybe_rotate_cookies() -> bool:
         return False
 
     _persist_rotated_cookies(_jar_cookie_str(cj))
+    _rotate_state["last_success"] = time.time()
     log("[COOKIE] __Secure-1PSIDTS rotated successfully - session refreshed")
     return True
 
 
 def _cached_page_tokens() -> dict:
     now = time.time()
+    # Proactive keep-alive: refresh __Secure-1PSIDTS every ~25 min while it is
+    # still valid. Waiting until requests fail is too late - rotation gets 401
+    # once the cookie is dead. Disable with GEMINI_COOKIE_ROTATION=0.
+    rotate_interval = 0 if os.environ.get("GEMINI_COOKIE_ROTATION", "1") == "0" else 1500
+    if rotate_interval and now - max(_rotate_state["last_success"],
+                                     _rotate_state["last_attempt"]) > rotate_interval:
+        _maybe_rotate_cookies(force=True)
     if now - _page_tokens_cache["ts"] > 600:
         tokens = _get_page_tokens()
         if tokens.get("at"):
