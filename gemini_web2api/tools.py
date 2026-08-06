@@ -157,9 +157,44 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
     return prompt, images
 
 
-def parse_tool_calls(text: str) -> tuple:
+def _tool_param_names(tools: list) -> dict:
+    """Map tool name -> ordered parameter names from OpenAI-format tool defs."""
+    names = {}
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function", tool) if tool.get("type") == "function" else tool
+        name = fn.get("name", tool.get("name", ""))
+        props = (fn.get("parameters") or tool.get("parameters") or {}).get("properties")
+        if isinstance(props, dict):
+            names[name] = list(props.keys())
+    return names
+
+
+def _normalize_args(args, param_names: list) -> dict:
+    """Coerce tool arguments into a JSON object.
+
+    The OpenAI spec requires function arguments to be a JSON object, but the
+    model occasionally emits a positional array or bare scalar. Map array
+    items onto the tool's declared parameter names so clients can parse them.
+    """
+    if isinstance(args, dict):
+        return args
+    if isinstance(args, (list, tuple)):
+        obj = {}
+        for i, v in enumerate(args):
+            key = param_names[i] if i < len(param_names) else f"arg{i}"
+            obj[key] = v
+        return obj
+    if args is None:
+        return {}
+    return {"value": args}
+
+
+def parse_tool_calls(text: str, tools: list = None) -> tuple:
     """Extract tool_call blocks. Returns (clean_text, tool_calls_list)."""
     tool_calls = []
+    param_map = _tool_param_names(tools)
     pattern = r'```tool_call\s*\n(.*?)\n```'
     clean_parts = []
     last_end = 0
@@ -168,12 +203,14 @@ def parse_tool_calls(text: str) -> tuple:
         last_end = m.end()
         try:
             data = json.loads(m.group(1).strip())
+            args = _normalize_args(data.get("arguments", {}),
+                                   param_map.get(data["name"], []))
             tool_calls.append({
                 "id": f"call_{uuid.uuid4().hex[:8]}",
                 "type": "function",
                 "function": {
                     "name": data["name"],
-                    "arguments": json.dumps(data.get("arguments", {}), ensure_ascii=False),
+                    "arguments": json.dumps(args, ensure_ascii=False),
                 },
             })
         except (json.JSONDecodeError, KeyError):
@@ -291,7 +328,7 @@ def google_contents_to_prompt(req: dict) -> tuple:
     return "\n\n".join(p for p in parts if p), images
 
 
-def parse_google_function_calls(text: str) -> tuple:
+def parse_google_function_calls(text: str, param_names_by_tool: dict = None) -> tuple:
     """Extract function_call blocks from model output.
 
     Handles 3 formats:
@@ -299,12 +336,17 @@ def parse_google_function_calls(text: str) -> tuple:
     2. function_call\\n{...} (without backticks)
     3. Raw JSON with "name" + "args" keys
 
-    Returns (clean_text, [{"name": ..., "args": ...}])
+    Returns (clean_text, [{"name": ..., "args": ...}]) where args is always a dict.
     """
     function_calls = []
     pattern1 = r'```function_call\s*\n(.*?)\n```'
     pattern2 = r'(?:^|\n)function_call\s*\n(\{[^`]*?\})'
     clean = text
+
+    def _pick_args(data):
+        return _normalize_args(data.get("args", data.get("arguments", {})),
+                               (param_names_by_tool or {}).get(data["name"], []))
+
     for pattern in [pattern1, pattern2]:
         for match in re.findall(pattern, clean, re.DOTALL):
             try:
@@ -312,7 +354,7 @@ def parse_google_function_calls(text: str) -> tuple:
                 if "name" in data:
                     function_calls.append({
                         "name": data["name"],
-                        "args": data.get("args", data.get("arguments", {})),
+                        "args": _pick_args(data),
                     })
             except (json.JSONDecodeError, KeyError):
                 pass
@@ -323,7 +365,7 @@ def parse_google_function_calls(text: str) -> tuple:
             if "name" in data and ("args" in data or "arguments" in data):
                 function_calls.append({
                     "name": data["name"],
-                    "args": data.get("args", data.get("arguments", {})),
+                    "args": _pick_args(data),
                 })
                 clean = ""
         except (json.JSONDecodeError, KeyError):

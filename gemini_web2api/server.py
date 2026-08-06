@@ -199,7 +199,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         tool_calls = None
         if tools and text and tool_choice != "none":
-            text, tool_calls = parse_tool_calls(text)
+            text, tool_calls = parse_tool_calls(text, tools)
         msg = {"role": "assistant", "content": text or None}
         if tool_calls:
             msg["tool_calls"] = tool_calls
@@ -301,7 +301,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         tool_calls = None
         if tools and text and tool_choice != "none":
-            text, tool_calls = parse_tool_calls(text)
+            text, tool_calls = parse_tool_calls(text, tools)
 
         rid = f"resp_{uuid.uuid4().hex[:16]}"
         mid = f"msg_{uuid.uuid4().hex[:12]}"
@@ -404,7 +404,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         response_parts = []
         if has_tools and text:
-            clean_text, function_calls = parse_google_function_calls(text)
+            # Map positional/array args onto declared parameter names
+            param_names = {}
+            for tool_group in req.get("tools") or []:
+                for fn in tool_group.get("functionDeclarations", []):
+                    props = (fn.get("parameters") or fn.get("parametersJsonSchema") or {}).get("properties")
+                    if isinstance(props, dict):
+                        param_names[fn.get("name", "")] = list(props.keys())
+            clean_text, function_calls = parse_google_function_calls(text, param_names)
             if function_calls:
                 if clean_text:
                     response_parts.append({"text": clean_text})
