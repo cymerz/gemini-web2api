@@ -155,6 +155,20 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     params = {"f.req": json.dumps(outer)}
     if CONFIG.get("xsrf_token"):
         params["at"] = CONFIG["xsrf_token"]
+    elif file_refs:
+        # Attachment requests require the XSRF "at" token; without it the
+        # upstream rejects the request with BardErrorInfo [1003].
+        try:
+            from .multimodal import _cached_page_tokens
+            at = _cached_page_tokens().get("at")
+            if at:
+                params["at"] = at
+                log("[MULTIMODAL] Using page-derived XSRF 'at' token for attachment request")
+            else:
+                log("[MULTIMODAL] WARNING: no XSRF 'at' token available - "
+                    "attachment request may be rejected upstream (set xsrf_token in config)")
+        except Exception as e:
+            log(f"[MULTIMODAL] WARNING: failed to obtain XSRF 'at' token: {e}")
     return urllib.parse.urlencode(params)
 
 
@@ -202,7 +216,7 @@ def _extract_texts_from_line(line: str) -> list:
 
 def extract_response_text(raw: str) -> str:
     """Parse full response to get final text."""
-    bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
+    bard_err = re.search(r'BardErrorInfo[^[]*\[(\d+)\]', raw)
     if bard_err:
         log(f"[COOKIE] WARNING: upstream BardErrorInfo [{bard_err.group(1)}] - "
             f"if authenticated, the cookie may be expired or invalid")
@@ -305,7 +319,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 for chunk in resp.iter_text():
                     buf += chunk
                     if "BardErrorInfo" in buf:
-                        bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
+                        bard_err = re.search(r'BardErrorInfo[^[]*\[(\d+)\]', buf)
                         if bard_err:
                             log(f"[COOKIE] WARNING: upstream BardErrorInfo [{bard_err.group(1)}] - "
                                 f"if authenticated, the cookie may be expired or invalid")
