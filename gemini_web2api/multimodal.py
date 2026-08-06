@@ -22,7 +22,14 @@ def _get_page_tokens() -> dict:
         headers["Cookie"] = cookie_str
     try:
         req = urllib.request.Request("https://gemini.google.com/app", headers=headers)
-        resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=30)
+        proxy = CONFIG.get("proxy")
+        if proxy:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                urllib.request.HTTPSHandler(context=_get_ssl_ctx()))
+            resp = opener.open(req, timeout=30)
+        else:
+            resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=30)
         html = resp.read().decode()
         tokens = {}
         for key, pattern in [
@@ -33,6 +40,12 @@ def _get_page_tokens() -> dict:
             m = re.search(pattern, html)
             if m:
                 tokens[key] = m.group(1)
+        # SNlM0e is the documented XSRF token field (see README); thykhd may
+        # have been renamed upstream, so fall back to it for the "at" token.
+        if not tokens.get("at"):
+            m = re.search(r'SNlM0e":"([^"]+)"', html) or re.search(r'SNlM0e=([^"&\s]+)', html)
+            if m:
+                tokens["at"] = m.group(1)
         return tokens
     except Exception as e:
         log(f"Page token fetch failed: {e}")

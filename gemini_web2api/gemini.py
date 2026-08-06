@@ -153,22 +153,28 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
             inner[k] = v
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
-    if CONFIG.get("xsrf_token"):
-        params["at"] = CONFIG["xsrf_token"]
-    elif file_refs:
+    if file_refs:
         # Attachment requests require the XSRF "at" token; without it the
         # upstream rejects the request with BardErrorInfo [1003].
-        try:
-            from .multimodal import _cached_page_tokens
-            at = _cached_page_tokens().get("at")
-            if at:
-                params["at"] = at
-                log("[MULTIMODAL] Using page-derived XSRF 'at' token for attachment request")
-            else:
-                log("[MULTIMODAL] WARNING: no XSRF 'at' token available - "
-                    "attachment request may be rejected upstream (set xsrf_token in config)")
-        except Exception as e:
-            log(f"[MULTIMODAL] WARNING: failed to obtain XSRF 'at' token: {e}")
+        at = CONFIG.get("xsrf_token")
+        at_source = "config xsrf_token"
+        if not at:
+            try:
+                from .multimodal import _cached_page_tokens
+                at = _cached_page_tokens().get("at")
+                at_source = "page-derived token"
+            except Exception as e:
+                log(f"[MULTIMODAL] WARNING: failed to obtain XSRF 'at' token: {e}")
+        if at:
+            params["at"] = at
+            log(f"[MULTIMODAL] Attachment request: {len(file_refs)} file(s), "
+                f"XSRF 'at' token from {at_source}")
+        else:
+            log("[MULTIMODAL] WARNING: attachment request sent WITHOUT XSRF 'at' token - "
+                "upstream will likely reject with BardErrorInfo [1003] "
+                "(set xsrf_token in config from the page SNlM0e value)")
+    elif CONFIG.get("xsrf_token"):
+        params["at"] = CONFIG["xsrf_token"]
     return urllib.parse.urlencode(params)
 
 
