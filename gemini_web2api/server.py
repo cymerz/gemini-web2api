@@ -24,6 +24,8 @@ def _upload_images(images: list) -> list:
     """Upload images via Scotty resumable upload, return file references.
 
     Each item is (bytes_or_url, mime_type). Returns None if no usable images.
+    Each returned entry is (file_ref, mime_type, filename) as required by the
+    StreamGenerate attachment payload.
     """
     if not images:
         return None
@@ -38,8 +40,9 @@ def _upload_images(images: list) -> list:
                 mime = mime or "image/png"
                 if data:
                     ext = mime.rsplit("/", 1)[-1].split("+")[0]
-                    ref = upload_image(data, f"image.{ext}", mime)
-                    file_refs.append(ref)
+                    filename = f"image.{ext}"
+                    ref = upload_image(data, filename, mime)
+                    file_refs.append((ref, mime, filename))
         except Exception as e:
             log(f"Image upload failed: {e}")
     return file_refs if file_refs else None

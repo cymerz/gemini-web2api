@@ -128,8 +128,21 @@ def _build_headers() -> dict:
 def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     inner = [None] * 102
     if file_refs:
-        refs = [[None, None, ref] for ref in file_refs]
-        inner[0] = [prompt, 0, None, refs, None, None, 0]
+        # Attachment format captured from the real Gemini web UI (2026 protocol):
+        # each entry is [[ref, 1, null, mime], filename, null x6, [0]]
+        attachments = []
+        for item in file_refs:
+            if isinstance(item, (tuple, list)) and len(item) == 3:
+                ref, mime, name = item
+            else:
+                ref, mime, name = item, "image/png", "image.png"
+            attachments.append([
+                [ref, 1, None, mime],
+                name,
+                None, None, None, None, None, None,
+                [0],
+            ])
+        inner[0] = [prompt, 0, None, attachments, None, None, 0]
     else:
         inner[0] = [prompt, 0, None, None, None, None, 0]
     inner[1] = ["en"]
