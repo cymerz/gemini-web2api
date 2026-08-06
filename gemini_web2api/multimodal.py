@@ -126,7 +126,7 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
     if not file_ref or not file_ref.startswith("/"):
         raise RuntimeError(f"Invalid file reference: {file_ref[:100]}")
 
-    log(f"Image uploaded: {filename} -> {file_ref[:50]}...")
+    log(f"Image uploaded: {filename} ({mime}, {len(image_bytes)} bytes) -> {file_ref}")
     return file_ref
 
 
