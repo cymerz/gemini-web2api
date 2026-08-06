@@ -64,6 +64,8 @@ DEFAULT_CONFIG = {
 
 CONFIG = dict(DEFAULT_CONFIG)
 
+_cookie_warned = {"missing": False, "hash": None}
+
 # ─── Models ──────────────────────────────────────────────────────────────────
 # Mapping from JS source: MODE_CATEGORY enum (028-6eb337387583.js)
 #   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
@@ -113,6 +115,9 @@ def load_cookie() -> tuple:
     if not cookie_file:
         return "", None
     if not os.path.exists(cookie_file):
+        if not _cookie_warned["missing"]:
+            log(f"[COOKIE] WARNING: cookie file not found: {cookie_file} - requests will be unauthenticated")
+            _cookie_warned["missing"] = True
         return "", None
     try:
         with open(cookie_file, "r") as f:
@@ -125,9 +130,19 @@ def load_cookie() -> tuple:
             cookie_str = content
             pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
             sapisid = pairs.get("SAPISID", "")
+        content_hash = hashlib.sha1(cookie_str.encode()).hexdigest()
+        if content_hash != _cookie_warned["hash"]:
+            _cookie_warned["hash"] = content_hash
+            if cookie_str and sapisid:
+                log(f"[COOKIE] Loaded cookie from {cookie_file}: SAPISID present - authenticated requests enabled")
+            elif cookie_str:
+                log(f"[COOKIE] WARNING: loaded cookie from {cookie_file} but SAPISID missing - "
+                    f"requests will be sent without SAPISIDHASH authorization")
+            else:
+                log(f"[COOKIE] WARNING: cookie file {cookie_file} is empty")
         return cookie_str, sapisid if sapisid else None
     except Exception as e:
-        log(f"Cookie load error: {e}")
+        log(f"[COOKIE] ERROR loading cookie from {cookie_file}: {e} - requests will be unauthenticated")
         return "", None
 
 
@@ -238,6 +253,8 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int) -> str:
         headers["Cookie"] = cookie_str
     if sapisid:
         headers["Authorization"] = make_sapisidhash(sapisid)
+    auth = ("cookie+SAPISIDHASH" if sapisid else
+            "cookie only (no SAPISID)" if cookie_str else "no cookie (anonymous)")
 
     last_err = None
     for attempt in range(CONFIG["retry_attempts"]):
@@ -253,8 +270,12 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int) -> str:
                 resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
-            return resp.read().decode("utf-8", errors="replace")
+            raw = resp.read().decode("utf-8", errors="replace")
+            log(f"[COOKIE] Request OK (HTTP {resp.status}, auth: {auth})")
+            return raw
         except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                log(f"[COOKIE] AUTH FAILURE: HTTP {e.code} (auth: {auth}) - cookie may be expired or invalid")
             if e.code == 405 and update_bl_if_needed():
                 reqid = int(time.time()) % 1000000
                 url = (
@@ -267,13 +288,14 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int) -> str:
                 continue
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']} (auth: {auth}): {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']} (auth: {auth}): {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
+    log(f"[COOKIE] Request failed after {CONFIG['retry_attempts']} attempts (auth: {auth}): {last_err}")
     raise last_err
 
 
@@ -324,6 +346,8 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int):
         headers["Cookie"] = cookie_str
     if sapisid:
         headers["Authorization"] = make_sapisidhash(sapisid)
+    auth = ("cookie+SAPISIDHASH" if sapisid else
+            "cookie only (no SAPISID)" if cookie_str else "no cookie (anonymous)")
 
     proxy = CONFIG.get("proxy")
 
@@ -341,6 +365,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int):
         try:
             with client.stream("POST", url, content=body, headers=headers) as resp:
                 resp.raise_for_status()
+                log(f"[COOKIE] Stream OK (HTTP {resp.status_code}, auth: {auth})")
                 buf = ""
                 for chunk in resp.iter_text():
                     buf += chunk
@@ -348,6 +373,8 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int):
                         import re as _re
                         m = _re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
                         if m:
+                            log(f"[COOKIE] WARNING: upstream BardErrorInfo [{m.group(1)}] - "
+                                f"if authenticated, the cookie may be expired or invalid")
                             raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{m.group(1)}]")
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
@@ -372,6 +399,9 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int):
                         except (json.JSONDecodeError, IndexError, TypeError):
                             pass
         except Exception as e:
+            status = getattr(getattr(e, 'response', None), 'status_code', None)
+            if status in (401, 403):
+                log(f"[COOKIE] AUTH FAILURE: HTTP {status} (auth: {auth}) - cookie may be expired or invalid")
             if HAS_HTTPX and hasattr(e, 'response') and getattr(e.response, 'status_code', 0) == 405:
                 if update_bl_if_needed():
                     log("BL updated, falling back to non-streaming for this request")
@@ -397,6 +427,8 @@ def extract_response_text(raw: str) -> str:
     import re as _re
     bard_err = _re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
     if bard_err:
+        log(f"[COOKIE] WARNING: upstream BardErrorInfo [{bard_err.group(1)}] - "
+            f"if authenticated, the cookie may be expired or invalid")
         raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
     texts = []
     for line in raw.split("\n"):
@@ -906,6 +938,26 @@ def load_config(path: str):
         log(f"Config loaded: {path}")
 
 
+def check_cookie_status() -> str:
+    """Verify cookie configuration at startup. Returns status summary string."""
+    cookie_file = CONFIG.get("cookie_file")
+    if not cookie_file:
+        log("[COOKIE] Startup check: no cookie_file configured - running in anonymous mode")
+        return "none (anonymous)"
+    if not os.path.exists(cookie_file):
+        log(f"[COOKIE] Startup check: WARNING - cookie file not found: {cookie_file}")
+        return f"MISSING FILE ({cookie_file})"
+    cookie_str, sapisid = load_cookie()
+    if not cookie_str:
+        log(f"[COOKIE] Startup check: WARNING - cookie file is empty or unreadable: {cookie_file}")
+        return f"INVALID - empty ({cookie_file})"
+    if sapisid:
+        log(f"[COOKIE] Startup check: OK - cookie valid with SAPISID ({cookie_file})")
+        return f"valid with SAPISID ({cookie_file})"
+    log(f"[COOKIE] Startup check: WARNING - cookie has no SAPISID ({cookie_file})")
+    return f"loaded, no SAPISID ({cookie_file})"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Gemini Web to OpenAI API")
     parser.add_argument("--port", type=int, default=None)
@@ -934,6 +986,8 @@ def main():
     if new_bl:
         CONFIG["gemini_bl"] = new_bl
 
+    cookie_status = check_cookie_status()
+
     class ThreadedServer(ThreadingMixIn, HTTPServer):
         daemon_threads = True
         allow_reuse_address = True
@@ -944,7 +998,7 @@ def main():
     print(f"  Listening: http://0.0.0.0:{port}")
     print(f"  Base URL:  http://localhost:{port}/v1")
     print(f"  Models:    {', '.join(MODELS.keys())}")
-    print(f"  Cookie:    {'yes (' + CONFIG['cookie_file'] + ')' if CONFIG.get('cookie_file') else 'none (anonymous)'}")
+    print(f"  Cookie:    {cookie_status}")
     print(f"  Proxy:     {CONFIG.get('proxy') or 'none (uses system env HTTP_PROXY/HTTPS_PROXY)'}")
     print(f"  Retry:     {CONFIG['retry_attempts']}x / {CONFIG['retry_delay_sec']}s")
     print(f"  BL:        {CONFIG['gemini_bl']}")

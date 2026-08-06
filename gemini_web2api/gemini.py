@@ -20,6 +20,7 @@ from .config import CONFIG
 _ssl_ctx = None
 _cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
 _httpx_client = None
+_cookie_warned = {"unconfigured": False, "missing": False}
 
 
 def log(msg: str):
@@ -48,12 +49,21 @@ def _get_httpx_client():
 def load_cookie() -> tuple:
     """Load cookie from file with mtime-based caching."""
     cookie_file = CONFIG.get("cookie_file")
-    if not cookie_file or not os.path.exists(cookie_file):
+    if not cookie_file:
+        if not _cookie_warned["unconfigured"]:
+            log("[COOKIE] No cookie_file configured - running in anonymous mode")
+            _cookie_warned["unconfigured"] = True
+        return "", None
+    if not os.path.exists(cookie_file):
+        if not _cookie_warned["missing"]:
+            log(f"[COOKIE] WARNING: cookie file not found: {cookie_file} - requests will be unauthenticated")
+            _cookie_warned["missing"] = True
         return "", None
     try:
         mtime = os.path.getmtime(cookie_file)
         if mtime == _cookie_cache["mtime"] and _cookie_cache["str"]:
             return _cookie_cache["str"], _cookie_cache["sapisid"]
+        log(f"[COOKIE] Loading cookie from file: {cookie_file}")
         with open(cookie_file, "r") as f:
             content = f.read().strip()
         if content.startswith("{"):
@@ -65,9 +75,19 @@ def load_cookie() -> tuple:
             pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
             sapisid = pairs.get("SAPISID", "")
         _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
+        if cookie_str and sapisid:
+            log(f"[COOKIE] Cookie loaded OK: SAPISID present - authenticated requests enabled")
+        elif cookie_str:
+            log(f"[COOKIE] WARNING: cookie loaded but SAPISID missing - "
+                f"requests will be sent without SAPISIDHASH authorization")
+        else:
+            log(f"[COOKIE] WARNING: cookie file {cookie_file} is empty")
         return cookie_str, sapisid if sapisid else None
     except Exception as e:
-        log(f"Cookie load error: {e}")
+        if _cookie_cache["str"]:
+            log(f"[COOKIE] ERROR loading cookie from {cookie_file}: {e} - falling back to cached cookie")
+        else:
+            log(f"[COOKIE] ERROR loading cookie from {cookie_file}: {e} - requests will be unauthenticated")
         return _cookie_cache["str"], _cookie_cache["sapisid"]
 
 
@@ -183,6 +203,8 @@ def extract_response_text(raw: str) -> str:
     """Parse full response to get final text."""
     bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
     if bard_err:
+        log(f"[COOKIE] WARNING: upstream BardErrorInfo [{bard_err.group(1)}] - "
+            f"if authenticated, the cookie may be expired or invalid")
         raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
     last_text = ""
     for line in raw.split("\n"):
@@ -192,6 +214,15 @@ def extract_response_text(raw: str) -> str:
     return clean_text(last_text)
 
 
+def _auth_desc(headers: dict) -> str:
+    """Short description of the auth mode used for logging."""
+    if headers.get("Authorization"):
+        return "cookie+SAPISIDHASH"
+    if headers.get("Cookie"):
+        return "cookie only (no SAPISID)"
+    return "no cookie (anonymous)"
+
+
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     """Non-streaming generation with retry."""
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
@@ -199,6 +230,7 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     headers = _build_headers()
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
+    auth = _auth_desc(headers)
 
     last_err = None
     for attempt in range(CONFIG["retry_attempts"]):
@@ -213,12 +245,16 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
+            log(f"[COOKIE] Request OK (HTTP {resp.status}, auth: {auth})")
             return extract_response_text(raw)
         except Exception as e:
             last_err = e
+            if isinstance(e, urllib.error.HTTPError) and e.code in (401, 403):
+                log(f"[COOKIE] AUTH FAILURE: HTTP {e.code} (auth: {auth}) - cookie may be expired or invalid")
             if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']} (auth: {auth}): {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
+    log(f"[COOKIE] Request failed after {CONFIG['retry_attempts']} attempts (auth: {auth}): {last_err}")
     raise last_err
 
 
@@ -234,6 +270,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
     url = _get_url()
     headers = _build_headers()
     client = _get_httpx_client()
+    auth = _auth_desc(headers)
 
     last_err = None
     emitted_raw_text = ""
@@ -241,12 +278,15 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
         try:
             with client.stream("POST", url, content=body, headers=headers) as resp:
                 resp.raise_for_status()
+                log(f"[COOKIE] Stream OK (HTTP {resp.status_code}, auth: {auth})")
                 buf = ""
                 for chunk in resp.iter_text():
                     buf += chunk
                     if "BardErrorInfo" in buf:
                         bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
                         if bard_err:
+                            log(f"[COOKIE] WARNING: upstream BardErrorInfo [{bard_err.group(1)}] - "
+                                f"if authenticated, the cookie may be expired or invalid")
                             raise RuntimeError(
                                 f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]"
                             )
@@ -264,7 +304,11 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             return
         except Exception as e:
             last_err = e
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status in (401, 403):
+                log(f"[COOKIE] AUTH FAILURE: HTTP {status} (auth: {auth}) - cookie may be expired or invalid")
             if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+                log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']} (auth: {auth}): {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
+    log(f"[COOKIE] Stream failed after {CONFIG['retry_attempts']} attempts (auth: {auth}): {last_err}")
     raise last_err
