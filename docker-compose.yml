@@ -1,0 +1,36 @@
+services:
+  gemini-web2api:
+    build: .
+    image: gemini-web2api:latest
+    container_name: gemini-web2api
+    ports:
+      # Host port can be overridden via env: HOST_PORT=9000 docker compose up -d
+      - "${HOST_PORT:-8081}:8081"
+    volumes:
+      # Create from the example first: cp config.example.json config.json
+      - ./config.json:/app/config.json:ro
+      # Optional: enable only if you use cookie authentication.
+      # The file must exist before `docker compose up`, otherwise Docker
+      # creates it as a directory. Set "cookie_file": "/app/cookie.txt"
+      # in config.json when enabled.
+      # - ./cookie.txt:/app/cookie.txt:ro
+    # Optional proxy pass-through for the upstream Gemini requests:
+    # environment:
+    #   HTTP_PROXY: "http://host.docker.internal:7890"
+    #   HTTPS_PROXY: "http://host.docker.internal:7890"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8081/', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # If you get empty responses (content: null) with the default bridge
+    # network, Gemini may be rejecting Docker's NAT IP range. In that case
+    # comment out `ports:` above and uncomment:
+    # network_mode: host
